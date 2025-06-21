@@ -21,15 +21,16 @@ SMALL_GPU_INDEX = sys.argv[2]
 DF_START_INDEX  = int(sys.argv[3])
 DF_END_INDEX    = int(sys.argv[4])
 
-# Reverse Speculative Decoding with vLLM
-
-# large model proposes, small model filters
-# accept if large model token is within small model top 20 and has prob over 0.01
-# vocab match mask also
-# multiple trials on large model proposals
-# live per-token stat
-# html heatmap
-# closely resembling HF version
+# Reverse Speculative Decoding with vLLM in Token ID Space
+#
+# - Large model generates candidate tokens, small model validates them based on:
+#   * Token must be in small model's top-20 predictions
+#   * Token probability must exceed 0.01 threshold in small model's token distribution
+# - Operates entirely in token ID space using vLLM's TokensPrompt to avoid Unicode issues (U+FFFD)
+#   that commonly occur with rare mathematical symbols in reasoning traces when using BPE tokenization
+# - Vocabulary matching mask ensures only compatible tokens are proposed
+# - Special token mapping handles tokens unique to the small model's vocabulary by translating
+#   them to equivalent token sequences for the large model
 
 # --------------------------- imports ---------------------------------------
 import os, html, uuid, asyncio, contextlib, nest_asyncio, logging
@@ -37,6 +38,7 @@ from IPython.display import HTML, display
 
 import torch
 from huggingface_hub import snapshot_download
+from vllm import TokensPrompt  # CHANGE: Added TokensPrompt import
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.sampling_params import SamplingParams, RequestOutputKind
@@ -68,7 +70,7 @@ def visible_gpus(devices: str):
 # --------------------------- engine setup ----------------------------------
 async def setup_engines():
     global large_engine, small_engine, large_tokenizer, small_tokenizer
-    global large_vocab_size, small_vocab_size, vocab_match_mask
+    global large_vocab_size, small_vocab_size, vocab_match_mask, token_mapping
     
     large_checkpoint = snapshot_download(LARGE_MODEL_NAME)
     small_checkpoint = snapshot_download(SMALL_MODEL_NAME)
@@ -92,7 +94,7 @@ async def setup_engines():
                             tensor_parallel_size=1,
                             max_model_len=MAX_SEQ_LEN, 
                             gpu_memory_utilization=0.20,
-                            dtype="float16"),
+                            dtype="bfloat16"),
             start_engine_loop=True)
         
         small_tokenizer = await small_engine.get_tokenizer()
@@ -122,6 +124,34 @@ async def setup_engines():
 
     print(f"Unmatched tokens: {len(mismatches)}")
 
+    # print every mismatch 
+    print(f"\n{'ID':>6}  {'Large token':<25}  Small token")
+    for idx, large_token, small_token in mismatches:
+        large_token  = "None" if large_token is None else str(large_token)
+        small_token  = "None" if small_token is None else str(small_token)
+        print(f"{idx:6}  {large_token:<25}  {small_token}")
+
+    # show how the large tokenizer splits "<think>" and "</think>"
+    for token_str in ("<think>", "</think>"):
+        token_ids   = large_tokenizer.encode(token_str, add_special_tokens=False)
+        token_pieces = [large_tokenizer.convert_ids_to_tokens(token_id) for token_id in token_ids]
+
+        print(f"\nTokenization of {token_str!r} by the large tokenizer:")
+        print(f"{'ID':>6}  Token piece")
+        for token_id, token_piece in zip(token_ids, token_pieces):
+            print(f"{token_id:6}  {token_piece}")
+
+    # U+FFFD FIX: Added token mapping for special tokens
+    # Create mapping for tokens that only exist in small model
+    # When small model generates these tokens, we need to translate them
+    # to equivalent token sequences for the large model
+    token_mapping = {
+        151665: [27, 14172, 9655, 29],   # <tool_response>  --> <, tool, _response, >
+        151666: [522, 14172, 9655, 29],  # </tool_response> --> </, tool, _response, >
+        151667: [13708, 766, 29],        # <think>          --> <th, ink, >
+        151668: [522, 26865, 29],        # </think>         --> </, think, >
+    }
+
 # --------------------------- sampling params -------------------------------
 large_sampling_params = SamplingParams(
     max_tokens  = 1,
@@ -138,34 +168,28 @@ small_sampling_params = SamplingParams(
     output_kind = RequestOutputKind.DELTA,
 )
 
-# -------------------------- helper functions -------------------------------
-async def one_step(engine, sampling_params, context):
-    generator = engine.generate(context, sampling_params, request_id=str(uuid.uuid4()))
+# ------------------------- core decode loop --------------------------------
+# U+FFFD FIX: Modified one_step to accept token IDs and use TokensPrompt
+async def one_step(engine, sampling_params, context_ids):
+    # Pass token IDs directly to vLLM using TokensPrompt
+    # This avoids any decoding issues with partial tokens
+    tokens_prompt = TokensPrompt(prompt_token_ids=context_ids)
+    generator = engine.generate(tokens_prompt, sampling_params, request_id=str(uuid.uuid4()))
     return (await anext(generator)).outputs[0]
 
-def html_heat(records):
-    probability_min, probability_max = 0.0, 0.2
-    def colour(probability):
-        if probability >= probability_max: 
-            return "rgb(0,0,0)"
-        red = int(255 * (probability_max - probability) / (probability_max - probability_min))
-        return f"rgb({red},0,0)"
-    spans = []
-    for record in records:
-        text = html.escape(record['text']).replace(" ", "&nbsp;")
-        style = f"color:{colour(record['small_probability'])};"
-        if record['fallback']: 
-            style += " text-decoration:underline;"
-        spans.append(f"<span style='{style}'>{text}</span>")
-    return HTML("<pre style='white-space:pre-wrap; line-height:1.45; "
-                "font-family:inherit; background:#fff; padding:8px; "
-                "border:1px solid #ddd;'>" + "".join(spans) + "</pre>")
-
-# ------------------------- core decode loop --------------------------------
 async def mixed_decode(prompt: str, max_new_tokens: int = MAX_NEW_TOKENS):
-    context = prompt
+    context_ids_small = small_tokenizer.encode(prompt)
+    context_ids_large = []
+    
+    # For large model, we need to handle special tokens during initial tokenization
+    for token_id in context_ids_small:
+        if token_id in token_mapping:
+            context_ids_large.extend(token_mapping[token_id])
+        else:
+            context_ids_large.append(token_id)
+    
     step_index = 0
-    PROB_THRESHOLD = 0.01
+    PROB_THRESHOLD = 0.01  
     NUM_TRIALS = 5 
 
     # Create tqdm progress bar
@@ -173,19 +197,15 @@ async def mixed_decode(prompt: str, max_new_tokens: int = MAX_NEW_TOKENS):
 
     for _ in range(max_new_tokens):
         large_output, small_output = await asyncio.gather(
-            one_step(large_engine, large_sampling_params, context),
-            one_step(small_engine, small_sampling_params, context))
-
-        # if step_index < 3:
-        #     print(f"  large_output: {large_output}")
-        #     print(f"  small_output: {small_output}")
+            one_step(large_engine, large_sampling_params, context_ids_large),
+            one_step(small_engine, small_sampling_params, context_ids_small))
 
         # Extract probabilities from large model output - logprobs is a list
         large_logprobs_dict = large_output.logprobs[0]  
         large_probs = {}
         for token_id, logprob in large_logprobs_dict.items():
             if vocab_match_mask[token_id] > 0:  # Only include vocab-matched tokens
-                large_probs[token_id] = torch.exp(torch.tensor(logprob.logprob)).item()  # Access .logprob attribute
+                large_probs[token_id] = torch.exp(torch.tensor(logprob.logprob)).item()
         
         idx_pool = torch.tensor(list(large_probs.keys()))
         prob_pool = torch.tensor(list(large_probs.values()))
@@ -195,7 +215,7 @@ async def mixed_decode(prompt: str, max_new_tokens: int = MAX_NEW_TOKENS):
         small_logprobs_dict = small_output.logprobs[0] 
         small_probs = {}
         for token_id, logprob in small_logprobs_dict.items():
-            small_probs[token_id] = torch.exp(torch.tensor(logprob.logprob)).item()  # Access .logprob attribute
+            small_probs[token_id] = torch.exp(torch.tensor(logprob.logprob)).item()
 
         # Try to accept a token from large model's distribution
         fallback = True
@@ -215,15 +235,15 @@ async def mixed_decode(prompt: str, max_new_tokens: int = MAX_NEW_TOKENS):
             pool_idx = torch.multinomial(prob_pool, 1).item()
             chosen_id = idx_pool[pool_idx].item()
 
-        # Get token text and probabilities for the chosen token
-        chosen = small_tokenizer.decode([chosen_id])
+        # Get token text for display only
+        chosen_text = small_tokenizer.decode([chosen_id])
         large_probability = large_probs.get(chosen_id, 0.0)
         small_probability = small_probs.get(chosen_id, 0.0)
 
         step_index += 1
         record = dict(
             idx=step_index, 
-            text=chosen, 
+            text=chosen_text,  # For display only
             token_id=chosen_id,
             fallback=fallback, 
             large_probability=large_probability, 
@@ -233,28 +253,36 @@ async def mixed_decode(prompt: str, max_new_tokens: int = MAX_NEW_TOKENS):
 
         # print(f"{step_index:4d}{'*' if fallback else ' '}\t"
         #       f"{large_probability:.4f}\t{small_probability:.4f}\t"
-        #       f"{chosen_id}\t'{chosen}'",
+        #       f"{chosen_id}\t'{chosen_text}'",
         #       flush=True)
 
         # Update progress bar
         pbar.update(1)
 
-        context += chosen
+        # Append to context in ID space for both models
+        context_ids_small.append(chosen_id)
+        
+        # For large model, check if we need to map the token
+        if chosen_id in token_mapping:
+            # Append the mapped token sequence
+            context_ids_large.extend(token_mapping[chosen_id])
+        else:
+            # Regular token, just append
+            context_ids_large.append(chosen_id)
+        
         if chosen_id == small_tokenizer.eos_token_id:
             break
+    
+    pbar.close()
 
 # ---------------------- high-level convenience -----------------------------
 async def run_mixed_decode(prompt: str, max_new_tokens: int = MAX_NEW_TOKENS):
-    # print("-"*80)
-    # print("Step\tL_Prob\tS_Prob\tTok_ID\tTok_Txt")
+
     records = []
+    
     async for record in mixed_decode(prompt, max_new_tokens):
         records.append(record)
-    # print("-"*80)
-    # display(html_heat(records))
-    # fallback_count = sum(record['fallback'] for record in records)
-    # print(f"Fallback tokens: {fallback_count}/{len(records)} "
-    #       f"({fallback_count/len(records)*100:.2f} %)")
+    
     return records
 
 # ------------------------ fire up the engines ------------------------------
@@ -381,7 +409,8 @@ def read_entry_qanda(db_path, index):
             print(f"Error reading entry {index}: {e}")
             return None, None
 
-def extract_boxed_answer(records):
+# U+FFFD FIX: Modified to decode entire ID sequence at once
+def extract_boxed_answer(records, tokenizer):
     """Extract the last \\boxed{} answer between tokens 151668 and 151645"""
     token_ids = [record['token_id'] for record in records]
     
@@ -398,16 +427,35 @@ def extract_boxed_answer(records):
     if start_pos >= end_pos:
         return None
 
-    # Extract text between the tokens
-    between_text = ''.join(record['text'] for record in records[start_pos:end_pos+1])
+    # Extract token IDs between the markers (including the end marker)
+    between_token_ids = token_ids[start_pos:end_pos+1]
     
-    # Find all \\boxed{} patterns
-    boxed_pattern = r'\\boxed\{([^}]*)\}'
-    matches = re.findall(boxed_pattern, between_text)
+    # Decode the entire sequence at once to avoid U+FFFD issues
+    between_text = tokenizer.decode(between_token_ids)
     
-    if matches:
-        return matches[-1]  # Return the last match
-    return None
+    # Find all \\boxed{} patterns with proper brace matching
+    matches = []
+    i = 0
+    while i < len(between_text):
+        boxed_start = between_text.find('\\boxed{', i)
+        if boxed_start == -1:
+            break
+        
+        j = boxed_start + 7  # Start after '\\boxed{'
+        brace_count = 1
+        while j < len(between_text) and brace_count > 0:
+            if between_text[j] == '{':
+                brace_count += 1
+            elif between_text[j] == '}':
+                brace_count -= 1
+            j += 1
+        
+        if brace_count == 0:
+            matches.append(between_text[boxed_start + 7:j-1])
+        
+        i = boxed_start + 1
+    
+    return matches[-1] if matches else None
 
 def llm_grader(expected_answer, boxed_answer, openai_client, model_name="gpt-4o-mini"):
 
@@ -453,6 +501,8 @@ def llm_grader(expected_answer, boxed_answer, openai_client, model_name="gpt-4o-
         return 'false'
 
 async def main():
+    NUM_SAMPLINGS = 16
+
     # Fire up the engines
     await setup_engines()
     
@@ -485,7 +535,7 @@ Assistant:
         
         candidate_traces = []
         
-        for j in range(16):
+        for j in range(NUM_SAMPLINGS):
             print(f"Started working on entry {i}, trial {j}")
 
             records = await run_mixed_decode(prompt)
@@ -510,7 +560,7 @@ Assistant:
                 continue
             
             # Third check: Extract boxed answer
-            boxed_answer = extract_boxed_answer(records)
+            boxed_answer = extract_boxed_answer(records, small_tokenizer)
                         
             # Early exit if boxed answer extraction fails
             if not boxed_answer:
@@ -545,8 +595,12 @@ Assistant:
             # Find shortest trace among candidates
             shortest_trace = min(candidate_traces, key=len)
             
-            # Reconstruct the generated text from the trace
-            generated_text = ''.join(record['text'] for record in shortest_trace)
+            # U+FFFD FIX: Reconstruct text by decoding only the generated token IDs
+            generated_ids = []
+            generated_ids.extend([record['token_id'] for record in shortest_trace])
+            
+            # Decode the generated part
+            generated_text = small_tokenizer.decode(generated_ids)
             
             # Safely update only this entry
             success = update_entry_trace(dataset_file, i, generated_text)

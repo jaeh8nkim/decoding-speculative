@@ -1,9 +1,6 @@
 """
-python datagen.py 2 0 0 249
-python datagen.py 3 1 250 499
-
-python datagen.py 2 0 500 749
-python datagen.py 3 1 750 999
+python datagen.py 2 0 111:121,131,134:173
+python datagen.py 3 1 250:499
 
   7B, fp16:  14 GB + kv cache 8192:   ~4 GB per sampling = ~22 GB (~0.50)
 0.6B, fp16: 1.2 GB + kv cache 8192: ~0.8 GB per sampling =  ~3 GB (~0.10)
@@ -12,14 +9,38 @@ python datagen.py 3 1 750 999
 import sys
 from tqdm import tqdm
 
-if len(sys.argv) != 5:
-    print("Usage: python datagen.py <LARGE_GPU_INDEX> <SMALL_GPU_INDEX> <DF_START_INDEX> <DF_END_INDEX>")
+if len(sys.argv) != 4:
+    print("Usage: python datagen.py <LARGE_GPU_INDEX> <SMALL_GPU_INDEX> <DF_INDEX_STRING>")
     sys.exit(1)
 
 LARGE_GPU_INDEX = sys.argv[1]
 SMALL_GPU_INDEX = sys.argv[2]
-DF_START_INDEX  = int(sys.argv[3])
-DF_END_INDEX    = int(sys.argv[4])
+DF_INDEX_STRING = sys.argv[3]
+
+def parse_indices(index_string):
+    """Parse index string like '123:125,129,140:145' into list of indices"""
+    indices = []
+    parts = index_string.split(',')
+    
+    for part in parts:
+        part = part.strip()
+        if ':' in part:
+            # Range like "123:125" (both inclusive)
+            start, end = part.split(':')
+            start, end = int(start), int(end)
+            indices.extend(range(start, end + 1))
+        else:
+            # Single index like "129"
+            indices.append(int(part))
+    
+    return sorted(list(set(indices)))  # Remove duplicates and sort
+
+try:
+    TARGET_INDICES = parse_indices(DF_INDEX_STRING)
+    print(f"Processing indices: {TARGET_INDICES}")
+except ValueError as e:
+    print(f"Error parsing index string '{DF_INDEX_STRING}': {e}")
+    sys.exit(1)
 
 # Reverse Speculative Decoding with vLLM in Token ID Space
 #
@@ -509,7 +530,7 @@ async def main():
     dataset_file = 'dataset_4qwen3.db'
     good_traces_count = 0
 
-    for i in range(DF_START_INDEX, DF_END_INDEX + 1):
+    for i in TARGET_INDICES:
         # Check if entry already has a trace (thread-safe)
         existing_trace = read_entry_trace(dataset_file, i)
         
@@ -614,9 +635,9 @@ Assistant:
             print(f"No generated trace matches the qualification. Leaving entry {i} empty")
         
         # Progress report
-        questions_done = i + 1 - DF_START_INDEX
-        total_questions = DF_END_INDEX + 1 - DF_START_INDEX
-        print(f"Progress: {questions_done} questions done, {good_traces_count} entries with good traces so far, {total_questions} total questions")
+        questions_done = TARGET_INDICES.index(i) + 1
+        total_questions = len(TARGET_INDICES)
+        print(f"Progress: {questions_done}/{total_questions} questions done, {good_traces_count} entries with good traces so far")
 
 if __name__ == "__main__":
     asyncio.run(main())

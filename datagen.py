@@ -483,16 +483,16 @@ def llm_grader(expected_answer, boxed_answer, openai_client, model_name="gpt-4o-
     def grader_prompt(expected_answer, boxed_answer):
         """Creates the system and user prompts for grading."""
         system_prompt = (
-            "You are an expert grader tasked with evaluating the correctness of an answer.\n"
-            "You will be provided with two pieces of text: the expected answer and the generated answer.\n"
-            "Your task is to determine if the generated answer is semantically equivalent to the expected answer.\n"
-            "Ignore minor formatting differences, extra whitespace, or trivial variations. For numerical answers, consider equivalent representations as correct (e.g., '1/2' and '0.5').\n"
-            "Respond with exactly one word: either 'true' (if correct) or 'false' (if incorrect). Do not include quotation marks, explanations, or any other text.\n"
+            f"You are an expert grader tasked with evaluating the correctness of an answer.\n"
+            f"You will be provided with two pieces of text: the expected answer and the generated answer.\n"
+            f"Your task is to determine if the generated answer is semantically equivalent to the expected answer.\n"
+            f"Ignore minor formatting differences, extra whitespace, or trivial variations. For numerical answers, consider equivalent representations as correct (e.g., '1/2' and '0.5').\n"
+            f"Respond with exactly one word: either 'true' (if correct) or 'false' (if incorrect). Do not include quotation marks, explanations, or any other text.\n"
         )
         user_prompt = (
-            "Expected answer:\n"
+            f"Expected answer:\n"
             f"{expected_answer}\n"
-            "Generated answer:\n"
+            f"Generated answer:\n"
             f"{boxed_answer}\n"
         )
         
@@ -541,25 +541,26 @@ async def main():
             
         # Get question and answer for this entry
         question, expected_answer = read_entry_qanda(dataset_file, i)
-
-        prompt = f"""A conversation between User and Assistant. The User asks a question, and the Assistant responds in two clearly defined sections: 1. Reasoning Process - A step-by-step, logical exploration and analysis of the problem, enclosed within <think> and </think> tags. 2. Answer - A direct and concise response based on the reasoning process, with the final answer enclosed within \\boxed{{}}. For example, 
-<think>
-reasoning process here
-</think>
-answer here
-\\boxed{{final answer here}}
-
-Now, continue the actual conversation below.
-User: {question}
-Assistant:
-<think>"""
         
+        system_prompt = (
+            f"You are Qwen, created by Alibaba Cloud. You are a helpful assistant.\n"
+            f"You must respond to every query in the following manner:\n"
+            f"First, provide a step-by-step logical exploration of the problem.\n"
+            f"Then, provide a clear and direct response based on your reasoning, with the final answer enclosed in \\boxed{{}}."
+        )
+
+        input = (
+            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+            f"<|im_start|>user\n{question}<|im_end|>\n"
+            f"<|im_start|>assistant\n<think>"
+        )
+
         candidate_traces = []
         
         for j in range(NUM_SAMPLINGS):
             print(f"Started working on entry {i}, trial {j}")
 
-            records = await run_mixed_decode(prompt)
+            records = await run_mixed_decode(input)
             
             # First check: Token count
             print(f"Token count: {len(records)}")

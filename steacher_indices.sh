@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J steacher_single       # Job name
+#SBATCH -J steacher_indices      # Job name
 #SBATCH --gres=gpu:1             # Request 1 GPU
 #SBATCH --output=steacher_%j.out # Output file (%j = job ID)
 #SBATCH --error=steacher_%j.err  # Error file
@@ -21,6 +21,7 @@ echo "Processing indices: $INDEX_RANGE"
 echo "Starting steacher_indices.py..."
 
 # Run the Python script with the provided index range
+# GPU index defaults to 0 (assigned by SLURM)
 python -u steacher_indices.py "$INDEX_RANGE"
 
 echo "Task completed!"

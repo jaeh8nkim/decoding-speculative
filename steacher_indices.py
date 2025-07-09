@@ -1,31 +1,39 @@
-#!/usr/bin/env python3
 """
-Steacher indices processing script - run this on compute nodes
-Usage examples:
-python steacher_indices.py 111:121,131,134:173
-python steacher_indices.py 250:499
+steacher_indices.py
+------------------
+Process specific indices using the downloaded model from steacher_download.py
 
-Memory requirements:
+Usage:
+python steacher_indices.py <INDEX_RANGE> [GPU_INDEX]
+python steacher_indices.py "111:121,131,134:173" 0
+python steacher_indices.py "250:499" 1
+
   7B, fp16:  14 GB + kv cache 8192:   ~4 GB per sampling = ~22 GB (~0.50)
 """
 
+import os
 import sys
 from pathlib import Path
 from tqdm import tqdm
 
-# Configuration
-BASE_DIR = Path.home() / "scratch" / "tommy2130"
-LARGE_CHECKPOINT_PATH = BASE_DIR / "models" / "s1.1-7B"
+# Path configuration (same as steacher_download.py)
+USER = os.environ["USER"]
+SCRATCH = "scratch2"  # change to "scratch" if needed
+
+BASE_DIR = Path(f"/{SCRATCH}/{USER}")
+MODEL_DIR = BASE_DIR / "models" / "s1.1-7B"
+CACHE_DIR = BASE_DIR / "hf_cache"
 
 # Parse command line arguments
-if len(sys.argv) != 2:
-    print("Usage: python steacher_indices.py <DF_INDEX_STRING>")
+if len(sys.argv) < 2 or len(sys.argv) > 3:
+    print("Usage: python steacher_indices.py <INDEX_RANGE> [GPU_INDEX]")
     print("Examples:")
-    print("  python steacher_indices.py 111:121,131,134:173")
-    print("  python steacher_indices.py 250:499")
+    print("  python steacher_indices.py \"111:121,131,134:173\"")
+    print("  python steacher_indices.py \"250:499\" 0")
     sys.exit(1)
 
 DF_INDEX_STRING = sys.argv[1]
+LARGE_GPU_INDEX = sys.argv[2] if len(sys.argv) == 3 else "0"
 
 def parse_indices(index_string):
     """Parse index string like '123:125,129,140:145' into list of indices"""
@@ -48,10 +56,16 @@ def parse_indices(index_string):
 try:
     TARGET_INDICES = parse_indices(DF_INDEX_STRING)
     print(f"Processing indices: {TARGET_INDICES}")
-    print(f"Model checkpoint: {LARGE_CHECKPOINT_PATH}")
-    print(f"Base directory: {BASE_DIR}")
+    print(f"Using GPU: {LARGE_GPU_INDEX}")
+    print(f"Model directory: {MODEL_DIR}")
 except ValueError as e:
     print(f"Error parsing index string '{DF_INDEX_STRING}': {e}")
+    sys.exit(1)
+
+# Check if model directory exists
+if not MODEL_DIR.exists():
+    print(f"Error: Model directory {MODEL_DIR} not found!")
+    print("Please run steacher_download.py first to download the model.")
     sys.exit(1)
 
 # Simple Decoding with vLLM in Token ID Space
@@ -61,7 +75,7 @@ except ValueError as e:
 #   that commonly occur with rare mathematical symbols in reasoning traces when using BPE tokenization
 
 # --------------------------- imports ---------------------------------------
-import os, uuid, asyncio, contextlib, nest_asyncio, logging
+import uuid, asyncio, contextlib, nest_asyncio, logging
 
 import torch
 from vllm import TokensPrompt
@@ -78,23 +92,35 @@ LARGE_TEMPERATURE = 0.7
 MAX_SEQ_LEN       = 8192
 MAX_NEW_TOKENS    = MAX_SEQ_LEN - 1024
 
+# ---------------- utility: temporarily set visible GPUs --------------------
+@contextlib.contextmanager
+def visible_gpus(devices: str):
+    original = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    os.environ["CUDA_VISIBLE_DEVICES"] = devices
+    print(f"\nCUDA_VISIBLE_DEVICES = {devices}")
+    try:
+        yield
+    finally:
+        os.environ["CUDA_VISIBLE_DEVICES"] = original
+
 # --------------------------- engine setup ----------------------------------
 async def setup_engines():
     global large_engine, large_tokenizer, large_vocab_size
     
-    print("torch sees", torch.cuda.device_count(), "GPU(s)")
-    print("Using GPU:", torch.cuda.current_device())
-    print(f"Loading model from: {LARGE_CHECKPOINT_PATH}")
-              
-    large_engine = AsyncLLMEngine.from_engine_args(
-        AsyncEngineArgs(model=str(LARGE_CHECKPOINT_PATH), 
-                        tensor_parallel_size=1,
-                        max_model_len=MAX_SEQ_LEN, 
-                        gpu_memory_utilization=0.60,
-                        dtype="float16"),
-        start_engine_loop=True)
-    
-    large_tokenizer = await large_engine.get_tokenizer()
+    # Use local model directory instead of downloading
+    large_checkpoint = str(MODEL_DIR)
+
+    with visible_gpus(LARGE_GPU_INDEX):
+        print("torch sees", torch.cuda.device_count(), "GPU(s)")              
+        large_engine = AsyncLLMEngine.from_engine_args(
+            AsyncEngineArgs(model=large_checkpoint, 
+                            tensor_parallel_size=1,
+                            max_model_len=MAX_SEQ_LEN, 
+                            gpu_memory_utilization=0.60,
+                            dtype="float16"),
+            start_engine_loop=True)
+        
+        large_tokenizer = await large_engine.get_tokenizer()
 
     # Get model config using async method
     large_model_config = await large_engine.get_model_config()
@@ -186,11 +212,6 @@ load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 client = openai.OpenAI(api_key=OPENAI_API_KEY)
-
-def get_database_path(filename):
-    """Get the full path to database file in the data directory"""
-    data_dir = Path(BASE_DIR) / "data"
-    return data_dir / filename
 
 def update_entry_trace(db_path, index, new_trace_value):
     """Update a single entry's trace field in SQLite with retry logic"""
@@ -412,18 +433,8 @@ async def main():
     # Fire up the engines
     await setup_engines()
     
-    # Use database path relative to data directory
-    # dataset_file = get_database_path('dataset_4qwen3.db')
-    dataset_file = get_database_path('dataset_s1p17b.db')
-    
-    print(f"Using database: {dataset_file}")
-    
-    # Check if database exists
-    if not dataset_file.exists():
-        print(f"❌ Error: Database file not found: {dataset_file}")
-        print(f"Make sure to copy your database to: {Path(BASE_DIR) / 'data'}")
-        sys.exit(1)
-    
+    # dataset_file = 'dataset_4qwen3.db'
+    dataset_file = 'dataset_s1p17b.db'
     good_traces_count = 0
 
     for i in TARGET_INDICES:

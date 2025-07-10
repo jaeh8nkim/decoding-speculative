@@ -48,15 +48,15 @@ SMALL_TEMPERATURE = 0.7
 
 # MODEL_NAME = "Qwen3-0.6B"
 # MODEL_REMOTE_PATH = "Qwen/" + MODEL_NAME
-# MODEL_LOCAL_PATH = "vanilla-qwen3-0.6b-local"
+# MODEL_LOCAL_PATH = MODEL_NAME + "-local"
 
-# MODEL_NAME = "s1-slth-qwen3-0.6b"
+# MODEL_NAME = "s1K-Distill-Qwen3-0.6B" + "-250710"
 # MODEL_REMOTE_PATH = "jaeh8nkim/" + MODEL_NAME
-# MODEL_LOCAL_PATH = "s1-slth-qwen3-0.6b-local"
+# MODEL_LOCAL_PATH = MODEL_NAME + "-local"
 
-MODEL_NAME = "s1-4q36-qwen3-0.6b"
+MODEL_NAME = "s1K4Q3p6B-Distill-Qwen3-0.6B" + "-250710"
 MODEL_REMOTE_PATH = "jaeh8nkim/" + MODEL_NAME
-MODEL_LOCAL_PATH = "s1-4q36-qwen3-0.6b-local"
+MODEL_LOCAL_PATH = MODEL_NAME + "-local"
 
 # Global variables for engine and tokenizer
 engine = None

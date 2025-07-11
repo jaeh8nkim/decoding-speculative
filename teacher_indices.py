@@ -53,6 +53,17 @@ from transformers import AutoTokenizer
 
 torch.set_grad_enabled(False)
 
+# ---------------- utility: temporarily set visible GPUs --------------------
+@contextlib.contextmanager
+def visible_gpus(devices: str):
+    original = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    os.environ["CUDA_VISIBLE_DEVICES"] = devices
+    print(f"\nCUDA_VISIBLE_DEVICES = {devices}")
+    try:
+        yield
+    finally:
+        os.environ["CUDA_VISIBLE_DEVICES"] = original
+
 # --------------------------- configuration ---------------------------------
 LARGE_MODEL_NAME  = "simplescaling/s1.1-7B"
 
@@ -64,32 +75,33 @@ MAX_NEW_TOKENS    = MAX_SEQ_LEN - 1024
 def setup_large_model():
     global large_model, large_tokenizer, large_sampling_params
     
-    print(f"Setting up model on GPU {LARGE_GPU_INDEX}")
-    print("torch sees", torch.cuda.device_count(), "GPU(s)")
-    
-    large_model = LLM(
-        LARGE_MODEL_NAME,
-        tensor_parallel_size=1,
-        dtype="float16",
-        max_model_len=MAX_SEQ_LEN,
-        gpu_memory_utilization=0.45,
-        device=f"cuda:{LARGE_GPU_INDEX}",  # Direct GPU specification
-    )
-    
-    large_tokenizer = AutoTokenizer.from_pretrained(LARGE_MODEL_NAME)
-    
-    # Get stop token IDs
-    stop_token_ids = large_tokenizer("<|im_end|>")["input_ids"]
-    
-    large_sampling_params = SamplingParams(
-        max_tokens=MAX_NEW_TOKENS,
-        min_tokens=0,
-        temperature=LARGE_TEMPERATURE,
-        top_p=0.95,
-        stop_token_ids=stop_token_ids,
-    )
-    
-    print(f"Large vocab size: {large_tokenizer.vocab_size}")
+    with visible_gpus(LARGE_GPU_INDEX):
+        print(f"Setting up model on GPU {LARGE_GPU_INDEX}")
+        print("torch sees", torch.cuda.device_count(), "GPU(s)")
+        
+        large_model = LLM(
+            LARGE_MODEL_NAME,
+            tensor_parallel_size=1,
+            dtype="float16",
+            max_model_len=MAX_SEQ_LEN,
+            gpu_memory_utilization=0.45,
+            # Remove device parameter - let CUDA_VISIBLE_DEVICES handle it
+        )
+        
+        large_tokenizer = AutoTokenizer.from_pretrained(LARGE_MODEL_NAME)
+        
+        # Get stop token IDs
+        stop_token_ids = large_tokenizer("<|im_end|>")["input_ids"]
+        
+        large_sampling_params = SamplingParams(
+            max_tokens=MAX_NEW_TOKENS,
+            min_tokens=0,
+            temperature=LARGE_TEMPERATURE,
+            top_p=0.95,
+            stop_token_ids=stop_token_ids,
+        )
+        
+        print(f"Large vocab size: {large_tokenizer.vocab_size}")
 
 # ------------------------- core decode loop --------------------------------
 def large_generate(prompt: str, max_new_tokens: int = MAX_NEW_TOKENS):
